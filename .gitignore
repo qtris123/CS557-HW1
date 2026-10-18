@@ -6,6 +6,9 @@ __pycache__/
 # Experiment logs and checkpoints
 runs/
 selected_runs/
+checkpoints/
+slurm_*.out
+slurm_*.err
 *.log
 *.zip
 *.tar.gz
@@ -22,3 +25,4 @@ ENV/
 # OS specific
 .DS_Store
 Thumbs.db
+solution/

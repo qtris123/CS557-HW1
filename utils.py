@@ -8,6 +8,7 @@ import gymnasium as gym
 import numpy as np
 import os
 import torch
+import cv2
 from wrapper import FrameStackResize
 
 
@@ -81,7 +82,7 @@ def preprocess_image(obs):
     return obs
 
 
-def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = False, max_length = None):
+def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = False, max_length = None, seed = None):
     """
     Evaluate the current policy on the environment.
     
@@ -97,32 +98,40 @@ def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = F
         (Optional) Rendered frames from each episode
     """
 
+    render_mode = "rgb_array" if return_frames else None
     if env_name == 'CarRacing-v2':
-        env = gym.make(env_name, render_mode="rgb_array", continuous=False)
+        env = gym.make(env_name, render_mode=render_mode, continuous=False)
         env = FrameStackResize(env, num_stack=4, resize_shape=(84, 84))
         is_cnn = True
     else:
-        env = gym.make(env_name, render_mode="rgb_array")
+        env = gym.make(env_name, render_mode=render_mode)
         is_cnn = False
 
+    was_training = policy.training
     policy.eval()
     rewards = []
     frames = []
     
     device = next(policy.parameters()).device
 
-    for _ in range(episodes):
-        obs, _ = env.reset()
+    def render_frame():
+        # Keep video capture bounded; full-resolution 1000-frame rollouts use gigabytes.
+        frame = env.render()
+        height, width = frame.shape[:2]
+        scale = min(1.0, 320.0 / max(height, width))
+        if scale < 1.0:
+            frame = cv2.resize(frame, (round(width * scale), round(height * scale)),
+                               interpolation=cv2.INTER_AREA)
+        return frame
+
+    for episode in range(episodes):
+        obs, _ = env.reset(seed=None if seed is None else seed + episode)
         done = False
         episode_reward = 0.0
         t = 0
 
         if return_frames:
-            # For CarRacing render the unwrapped env to get the RGB image
-            if is_cnn:
-                frames.append([env.env.render()])
-            else:
-                frames.append([env.render()])
+            frames.append([render_frame()])
         
         while not done:
 
@@ -131,23 +140,21 @@ def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = F
                 # For image observations, preprocess to channel-first format
                 # obs_processed = preprocess_image(obs)
                 # obs_vec = torch.from_numpy(obs_processed).float().unsqueeze(0)
-                obs_vec = torch.from_numpy(obs).float().unsqueeze(0).to(device)
+                obs_vec = torch.from_numpy(preprocess_image(obs)).float().unsqueeze(0).to(device)
             else:
                 # For vector observations, encode normally
                 obs_vec = torch.from_numpy(encode_obs(obs, obs_space)).float().unsqueeze(0).to(device)
 
 
             with torch.no_grad():
-                logits = policy(obs_vec)
-                # TODO: Select the action with highest probability from logits
-                action = logits.argmax(dim=-1).item()#
+                q_values = policy(obs_vec)
+                action = q_values.argmax(dim=-1).item()
             
             # Execute action in environment
-            # TODO: Step the environment using the selected action and accumulate reward
-            obs, reward, terminated, truncated, _ = env.step(action)#
+            obs, reward, terminated, truncated, _ = env.step(action)
 
             if return_frames:
-                frames[-1].append(env.render())
+                frames[-1].append(render_frame())
 
             episode_reward += reward
             done = terminated or truncated
@@ -160,6 +167,7 @@ def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = F
         rewards.append(episode_reward)
         
     env.close()
+    policy.train(was_training)
 
     avg_reward = float(np.mean(rewards)) if rewards else 0.0
 

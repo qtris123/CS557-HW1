@@ -5,7 +5,6 @@ Created by: Joseph Campbell and Guven Gergerli
 """
 
 import gymnasium as gym
-import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,6 +13,8 @@ from collections import namedtuple, deque
 import random
 
 import math
+import json
+from pathlib import Path
 from itertools import count
 import numpy as np
 
@@ -37,13 +38,10 @@ class ReplayMemory(object):
 
     def push(self, *args):
         """Saves a transition"""
-        # TODO: Add the transition to the memory 
-        # HINT: no need to return just add it to the memory.
-        0#TODO
+        self.memory.append(Transition(*args))
 
     def sample(self, batch_size):
-        # TODO: Implement random sampling from replay memory
-        return 0#TODO
+        return random.sample(self.memory, batch_size)
 
     def __len__(self):
         return len(self.memory)
@@ -88,27 +86,26 @@ class PrioritizedReplayMemory:
         Also compute importance sampling weights for bias correction.
         """
         # Get current priorities (only filled part of the buffer)
-        if len(self.memory) == self.capacity:
-            priorities = self.priorities
-        else:
-            priorities = self.priorities[:self.position]
+        if not self.memory:
+            raise ValueError("Cannot sample an empty replay buffer")
+        priorities = self.priorities[:len(self.memory)].astype(np.float64)
             
-        # TODO: Calculate sampling probabilities:
+        # Calculate sampling probabilities:
         # alpha determines how much prioritization is used 
         # (0 = uniform, 1 = full prioritization)
-        probs = 0#TODO
+        probs = priorities ** self.alpha
         probs /= np.sum(probs)
         
-        # TODO: Sample indices based on priorities and get corresponding transitions
-        indices = 0#TODO
+        # Sample with replacement, as in proportional PER.
+        indices = np.random.choice(len(self.memory), batch_size, p=probs)
         samples = [self.memory[idx] for idx in indices]
         
-        # TODO: Calculate importance sampling weights:
+        # Calculate importance sampling weights:
         # The sampling is biased towards high-priority samples since they are sampled more frequently.
-        # This can result on Q value overestimation towards high-priority samples.
-        # To correct for this bias, we use importance sampling weights.
+        # This changes the training distribution relative to uniform replay.
+        # Importance sampling weights compensate for that sampling bias.
         # Beta here controls how strongly you correct the bias using importance sampling (0 = no correction, 1 = full correction).
-        weights = 0#TODO
+        weights = (len(self.memory) * probs[indices]) ** (-self.beta)
         weights /= np.max(weights)  # Normalize weights
         weights = torch.tensor(weights, dtype=torch.float32)
         
@@ -116,9 +113,8 @@ class PrioritizedReplayMemory:
     
     def update_priorities(self, indices, td_errors):
         """Update priorities based on TD errors"""
-        for idx, td_error in zip(indices, td_errors):
-            # TODO: Priority is measured as absolute TD error plus small constant to avoid zero priority
-            self.priorities[idx] = 0#TODO
+        for idx, td_error in zip(indices, np.asarray(td_errors).reshape(-1)):
+            self.priorities[idx] = abs(float(td_error)) + self.eps
     
     def __len__(self):
         return len(self.memory)
@@ -133,7 +129,24 @@ class DQNAgent:
                  lr=1e-3, hidden_size = 128, replay_size = 10000, epsilon_start = 0.9, epsilon_end = 0.05, 
                  epsilon_decay = 500, gamma = 0.99, target_update = 10, tau = 0.005,
                  alpha=0.6, beta=0.4,
-                 use_double_dqn=False, use_per=False, dueling_dqn=False):
+                 use_double_dqn=False, use_per=False, dueling_dqn=False,
+                 seed=0, run_name=None, output_root=".", record_video=True):
+
+        self.seed = seed
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        if episodes < 1 or batch_size < 1 or replay_size < batch_size:
+            raise ValueError("Need episodes >= 1 and replay_size >= batch_size >= 1")
+        if target_update < 1 or save_interval < 1 or epsilon_decay <= 0:
+            raise ValueError("Update/save intervals and epsilon_decay must be positive")
+        if not 0 <= tau <= 1:
+            raise ValueError("tau must lie in [0, 1]")
+        self.record_video = record_video
         
         # Create environment
         self.env_name = env_name
@@ -159,6 +172,7 @@ class DQNAgent:
         
 
         self.action_space = self.env.action_space
+        self.action_space.seed(seed)
 
 
         # Hyperparameters
@@ -197,18 +211,18 @@ class DQNAgent:
         # but there is no policy in DQN, instead the actions are selected via epsilon-greedy from the Q-values.
         if self.dueling_dqn:
             if not self.is_cnn:
-                self.policy_net = DuelingMLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n).to(self.device)
-                self.target_net = DuelingMLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n).to(self.device)
+                self.policy_net = DuelingMLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
+                self.target_net = DuelingMLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
             else:
-                self.policy_net = DuelingCNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n).to(self.device)
-                self.target_net = DuelingCNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n).to(self.device)
+                self.policy_net = DuelingCNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
+                self.target_net = DuelingCNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
         else:
             if not self.is_cnn:
-                self.policy_net = MLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n).to(self.device)
-                self.target_net = MLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n).to(self.device)
+                self.policy_net = MLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n, hidden_sizes=(hidden_size, hidden_size)).to(self.device)
+                self.target_net = MLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n, hidden_sizes=(hidden_size, hidden_size)).to(self.device)
             else:
-                self.policy_net = CNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n).to(self.device)
-                self.target_net = CNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n).to(self.device)
+                self.policy_net = CNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
+                self.target_net = CNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
         # Target network, which is used for stable Q-value targets gets updated less frequently
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
@@ -237,7 +251,26 @@ class DQNAgent:
             self.variant_tag += "_dueling"
         if self.use_per:
             self.variant_tag += "_PERreplay"
-        self.logger = Logger(self.env_tag, self.env_name, self.action_space.n, self.variant_tag, self.num_params)
+        self.logger = Logger(self.env_tag, self.env_name, self.action_space.n,
+                             self.variant_tag, self.num_params, run_name=run_name,
+                             seed=seed, output_root=output_root)
+        self.checkpoint_dir = Path(output_root) / "checkpoints" / self.env_tag / Path(self.logger.log_dir).name
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.config = dict(
+            env=env_name, episodes=episodes, batch_size=batch_size, lr=lr,
+            hidden_size=hidden_size, replay_size=replay_size,
+            epsilon_start=epsilon_start, epsilon_end=epsilon_end,
+            epsilon_decay=epsilon_decay, gamma=gamma, target_update=target_update,
+            tau=tau, alpha=alpha, beta=beta, use_double_dqn=use_double_dqn,
+            use_per=use_per, dueling_dqn=dueling_dqn, seed=seed,
+            run_name=run_name, record_video=record_video, save_interval=save_interval,
+            device=str(self.device), torch_version=torch.__version__,
+            gymnasium_version=gym.__version__, numpy_version=np.__version__,
+            torch_threads=torch.get_num_threads(),
+        )
+        (Path(self.logger.log_dir) / "config.json").write_text(json.dumps(self.config, indent=2))
+        self.logger.writer.add_text("run/hyperparameters", json.dumps(self.config, indent=2))
+        print(f"Logs: {self.logger.log_dir}")
 
 
 
@@ -267,13 +300,11 @@ class DQNAgent:
                     state_encoded = utils.encode_obs(state, self.env.observation_space)
                     state_tensor = torch.from_numpy(state_encoded).float().unsqueeze(0).to(self.device)
 
-                # TODO: Return the greedy action from the policy network
+                # Return the greedy action from the policy network
                 # HINT: You need to get the action with the highest Q-value from the policy.
-                return 0#TODO
+                return self.policy_net(state_tensor).argmax(dim=1).item()
         else:
-            # TODO: return the return random action. 
-            # HINT: This is exploration
-            return 0#TODO
+            return self.action_space.sample()
         
 
     def optimize_model(self):
@@ -299,21 +330,16 @@ class DQNAgent:
         # Create masks for non-final states (to make sure we don't use final next states in target Q-value computation)
         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)), device=self.device, dtype=torch.bool)
 
-        if self.is_cnn:
-            # For image observations:
-            non_final_next_states = torch.cat([torch.from_numpy(utils.preprocess_image(s)).float().unsqueeze(0) 
-                                    for s in batch.next_state if s is not None]).to(self.device)
-            state_batch = torch.cat([torch.from_numpy(utils.preprocess_image(s)).float().unsqueeze(0) 
-                                    for s in batch.state]).to(self.device)
-        else:
-            # For vector observations:
-            non_final_next_states = torch.cat([torch.from_numpy(utils.encode_obs(s, self.env.observation_space)).float().unsqueeze(0) 
-                                    for s in batch.next_state if s is not None]).to(self.device)
-            state_batch = torch.cat([torch.from_numpy(utils.encode_obs(s, self.env.observation_space)).float().unsqueeze(0) 
-                                    for s in batch.state]).to(self.device)
+        def stack_states(states):
+            if self.is_cnn:
+                encoded = [utils.preprocess_image(s) for s in states]
+            else:
+                encoded = [utils.encode_obs(s, self.env.observation_space) for s in states]
+            return torch.as_tensor(np.stack(encoded), dtype=torch.float32, device=self.device)
 
-        action_batch = torch.tensor([[a] for a in batch.action], device=self.device)
-        reward_batch = torch.cat(batch.reward)
+        state_batch = stack_states(batch.state)
+        action_batch = torch.tensor(batch.action, device=self.device, dtype=torch.long).unsqueeze(1)
+        reward_batch = torch.cat(batch.reward).to(self.device, dtype=torch.float32)
 
 
         # Compute Q(s_t, a) for current states.
@@ -328,16 +354,14 @@ class DQNAgent:
         # We will have either the expected state value or 0 in case the state was final (via the mask)
         next_state_values = torch.zeros(self.batch_size, device=self.device)
         with torch.no_grad():
-            if self.use_double_dqn:
-                # * Double DQN Implementation
-                # TODO: Get the actions that maximize the Q values from the policy network (argmax)
-                best_actions = 0#TODO
-                # TODO: Get Q-values from target network using the actions from policy network. The target network only evaluates the chosen action's Q-value
-                next_state_values[non_final_mask] = 0#TODO
-            else:
-                # * DQN Implementation
-                # TODO: Take all Q-values from the target network and pick the max values directly again with the target network
-                next_state_values[non_final_mask] = 0#TODO
+            # An entire sampled batch can be terminal. Do not concatenate an empty list.
+            if non_final_mask.any():
+                non_final_next_states = stack_states([s for s in batch.next_state if s is not None])
+                if self.use_double_dqn:
+                    best_actions = self.policy_net(non_final_next_states).argmax(dim=1, keepdim=True)
+                    next_state_values[non_final_mask] = self.target_net(non_final_next_states).gather(1, best_actions).squeeze(1)
+                else:
+                    next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(dim=1).values
 
 
         # Compute the expected Q values (reward + discounted max next state value)
@@ -356,7 +380,8 @@ class DQNAgent:
             # Multiply the loss by the importance sampling weights that we get from the PER buffer
             criterion = nn.SmoothL1Loss(reduction='none')
             losses = (criterion(state_action_values, expected_state_action_values.unsqueeze(1)))
-            loss = (weights * losses).mean()
+            # losses is [B, 1]. Keep one weight per sample, avoiding [B, B] broadcasting.
+            loss = (weights * losses.squeeze(1)).mean()
         else:
             # * Standard Replay Implementation
             criterion = nn.SmoothL1Loss()
@@ -384,7 +409,7 @@ class DQNAgent:
         """Main training loop for DQN agent."""
 
         for i_episode in range(self.episodes):
-            state, info = self.env.reset()
+            state, info = self.env.reset(seed=self.seed + i_episode)
             total_reward = 0.0
             episode_loss = 0.0
             optimization_steps = 0
@@ -397,9 +422,10 @@ class DQNAgent:
                 # Accumulate reward
                 total_reward += reward
 
-                reward = torch.tensor([reward], device=self.device)
+                reward = torch.tensor([reward], dtype=torch.float32)
 
-                if terminated or truncated:
+                # A time-limit truncation still bootstraps from the final observation.
+                if terminated:
                     next_state = None
 
                 # Store the transition in memory
@@ -417,45 +443,48 @@ class DQNAgent:
 
                 # Soft update of the target network's weights
                 # θ′ ← τ θ + (1 −τ )θ′
-                if self.tau > 0 and t % self.target_update == 0:  # Soft update every target_update steps
+                if self.tau > 0 and self.steps_done % self.target_update == 0:
                     target_net_state_dict = self.target_net.state_dict()
                     policy_net_state_dict = self.policy_net.state_dict()
                     for key in policy_net_state_dict:
                         target_net_state_dict[key] = policy_net_state_dict[key]*self.tau + target_net_state_dict[key]*(1-self.tau)
                     self.target_net.load_state_dict(target_net_state_dict)
-                elif self.tau == 0 and t % self.target_update == 0:  # Hard update every target_update steps
+                elif self.tau == 0 and self.steps_done % self.target_update == 0:
                     self.target_net.load_state_dict(self.policy_net.state_dict())
 
                 if terminated or truncated:
                     break
 
             # Log episode statistics
-            self.logger.add_value('train-dqn/episode_reward', total_reward, i_episode)
+            episode = i_episode + 1
+            self.logger.add_value('train-dqn/episode_reward', total_reward, episode)
 
             if optimization_steps > 0:
                 avg_episode_loss = episode_loss / optimization_steps
-                self.logger.add_value('train-dqn/avg_loss', avg_episode_loss, i_episode)
+                self.logger.add_value('train-dqn/avg_loss', avg_episode_loss, episode)
 
-            self.logger.add_value('train-dqn/epsilon', self.eps_threshold, i_episode)
+            self.logger.add_value('train-dqn/epsilon', self.eps_threshold, episode)
+            self.logger.add_value('train-dqn/environment_steps', self.steps_done, episode)
 
             # Save model and evaluate at intervals
-            if i_episode % self.save_interval == 0:
-                if not os.path.exists('checkpoints'):
-                    os.makedirs('checkpoints')
-                torch.save(self.policy_net.state_dict(), f'checkpoints/{self.variant_tag}_{self.env_name}_episode_{i_episode}.pth')
+            if episode % self.save_interval == 0 or episode == self.episodes:
+                torch.save(self.policy_net.state_dict(), self.checkpoint_dir / f'episode_{episode}.pth')
                 
                 # Evaluate policy and log video
-                avg_eval_reward = utils.evaluate_policy(self.policy_net, self.env.observation_space, self.env_name, episodes=3, return_frames=False)
-                self.logger.add_value('train-dqn/eval_mean_reward', avg_eval_reward, i_episode)
+                avg_eval_reward = utils.evaluate_policy(self.policy_net, self.env.observation_space, self.env_name, episodes=3, return_frames=False, seed=100000 + self.seed)
+                self.logger.add_value('train-dqn/eval_mean_reward', avg_eval_reward, episode)
                 
                 # Log evaluation video
-                _, frames = utils.evaluate_policy(self.policy_net, self.env.observation_space, self.env_name, episodes=1, return_frames=True, max_length=1000)
-                self.logger.add_frames('train-dqn/eval_video', frames, i_episode)
+                if self.record_video:
+                    _, frames = utils.evaluate_policy(self.policy_net, self.env.observation_space, self.env_name, episodes=1, return_frames=True, max_length=300, seed=200000 + self.seed)
+                    self.logger.add_frames('train-dqn/eval_video', frames, episode)
 
-            print(f"Episode {i_episode} - Total Reward: {total_reward:.2f}, Epsilon: {self.eps_threshold:.3f}")
+            print(f"Episode {episode} - Total Reward: {total_reward:.2f}, Epsilon: {self.eps_threshold:.3f}")
 
         print('Training complete')
         self.env.close()
+        self.logger.writer.close()
+        (Path(self.logger.log_dir) / "completed.json").write_text(json.dumps({"episodes": self.episodes}))
 
 
 

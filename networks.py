@@ -59,14 +59,13 @@ class DuelingMLPNetwork(nn.Module):
     def forward(self, x):
         features = self.feature_layer(x)
 
-        #TODO: Implement value and advantage streams
-        value = 0#TODO
-        advantages = 0#TODO
+        value = self.value_head(features)
+        advantages = self.advantage_head(features)
 
-        # TODO: Now combine value and advantage using the dueling formula:
+        # Combine value and advantage using the dueling formula:
         # Q value is equal to the state value + advantages substracted by the mean advantage across all actions
         # This ensures the advantage head has zero mean. HINT: use keepdim=True in the mean calculation
-        return 0#TODO
+        return value + advantages - advantages.mean(dim=1, keepdim=True)
     
 
 

@@ -46,7 +46,7 @@ class CNNNetwork(nn.Module):
     def forward(self, x):
         # Expected x shape: (batch_size, channels, height, width)
         features = self.features(x)
-        features = features.view(features.size(0), -1)  # Flatten
+        features = features.flatten(1)  # Also handles noncontiguous/channel-last features.
         return self.fc(features)
 
 
@@ -95,16 +95,15 @@ class DuelingCNNNetwork(nn.Module):
     def forward(self, x):
         features = self.features(x)
         # Flatten
-        features = features.view(features.size(0), -1)  
+        features = features.flatten(1)
         
-        #TODO: Implement value and advantage streams
-        value = 0#TODO
-        advantages = 0#TODO
+        value = self.value_stream(features)
+        advantages = self.advantage_stream(features)
 
-        # TODO: Now combine value and advantage using the dueling formula:
+        # Combine value and advantage using the dueling formula:
         # Q value is equal to the state value + advantages substracted by the mean advantage across all actions
         # This ensures the advantage head has zero mean. HINT: use keepdim=True in the mean calculation
-        return 0#TODO
+        return value + advantages - advantages.mean(dim=1, keepdim=True)
     
 
 

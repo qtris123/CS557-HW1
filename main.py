@@ -11,16 +11,17 @@ Examples:
 
 import os
 import argparse
+import torch
 from dqn import DQNAgent
 
 DATA_DIR = "data"
 
 
 def main():
-    """Entry point for HW 2."""
+    """Entry point for CS 557 Homework 1."""
 
     parser = argparse.ArgumentParser(
-        description='CS 593 RL1: HW2',
+        description='CS 557 RLI: HW1 - Deep Q Networks',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -67,7 +68,7 @@ def main():
         '--num_epochs',
         type=int,
         default=100,
-        help='Number of training epochs'
+        help='Number of training episodes (the starter calls these epochs)'
     )
 
     parser.add_argument(
@@ -147,7 +148,13 @@ def main():
         help='Importance sampling exponent for PER'
     )
 
+    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--run_name', type=str, default=None)
+    parser.add_argument('--output_root', type=str, default='.')
+    parser.add_argument('--no_video', action='store_true', help='Log scalars without evaluation videos')
+    parser.add_argument('--torch_threads', type=int, default=1, help='CPU threads; 1 avoids overhead for small networks')
     args = parser.parse_args()
+    torch.set_num_threads(args.torch_threads)
 
     # Ensure directories exist
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -171,7 +178,11 @@ def main():
         beta=args.beta,
         use_double_dqn=args.use_double_dqn,
         use_per=args.use_per,
-        dueling_dqn=args.use_dueling_dqn
+        dueling_dqn=args.use_dueling_dqn,
+        seed=args.seed,
+        run_name=args.run_name,
+        output_root=args.output_root,
+        record_video=not args.no_video,
     )
     
     dqn_agent.train()

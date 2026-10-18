@@ -1,0 +1,1387 @@
+diff --git a/cnn_networks.py b/cnn_networks.py
+index 7923bba..c291563 100644
+--- a/cnn_networks.py
++++ b/cnn_networks.py
+@@ -46,7 +46,7 @@ class CNNNetwork(nn.Module):
+     def forward(self, x):
+         # Expected x shape: (batch_size, channels, height, width)
+         features = self.features(x)
+-        features = features.view(features.size(0), -1)  # Flatten
++        features = features.flatten(1)  # Also handles noncontiguous/channel-last features.
+         return self.fc(features)
+ 
+ 
+@@ -95,16 +95,15 @@ class DuelingCNNNetwork(nn.Module):
+     def forward(self, x):
+         features = self.features(x)
+         # Flatten
+-        features = features.view(features.size(0), -1)  
++        features = features.flatten(1)
+         
+-        #TODO: Implement value and advantage streams
+-        value = 0#TODO
+-        advantages = 0#TODO
++        value = self.value_stream(features)
++        advantages = self.advantage_stream(features)
+ 
+-        # TODO: Now combine value and advantage using the dueling formula:
++        # Combine value and advantage using the dueling formula:
+         # Q value is equal to the state value + advantages substracted by the mean advantage across all actions
+         # This ensures the advantage head has zero mean. HINT: use keepdim=True in the mean calculation
+-        return 0#TODO
++        return value + advantages - advantages.mean(dim=1, keepdim=True)
+     
+ 
+ 
+diff --git a/dqn.py b/dqn.py
+index 12bc417..9dfec72 100644
+--- a/dqn.py
++++ b/dqn.py
+@@ -5,7 +5,6 @@ Created by: Joseph Campbell and Guven Gergerli
+ """
+ 
+ import gymnasium as gym
+-import os
+ import torch
+ import torch.nn as nn
+ import torch.optim as optim
+@@ -14,6 +13,8 @@ from collections import namedtuple, deque
+ import random
+ 
+ import math
++import json
++from pathlib import Path
+ from itertools import count
+ import numpy as np
+ 
+@@ -37,13 +38,10 @@ class ReplayMemory(object):
+ 
+     def push(self, *args):
+         """Saves a transition"""
+-        # TODO: Add the transition to the memory 
+-        # HINT: no need to return just add it to the memory.
+-        0#TODO
++        self.memory.append(Transition(*args))
+ 
+     def sample(self, batch_size):
+-        # TODO: Implement random sampling from replay memory
+-        return 0#TODO
++        return random.sample(self.memory, batch_size)
+ 
+     def __len__(self):
+         return len(self.memory)
+@@ -88,27 +86,26 @@ class PrioritizedReplayMemory:
+         Also compute importance sampling weights for bias correction.
+         """
+         # Get current priorities (only filled part of the buffer)
+-        if len(self.memory) == self.capacity:
+-            priorities = self.priorities
+-        else:
+-            priorities = self.priorities[:self.position]
++        if not self.memory:
++            raise ValueError("Cannot sample an empty replay buffer")
++        priorities = self.priorities[:len(self.memory)].astype(np.float64)
+             
+-        # TODO: Calculate sampling probabilities:
++        # Calculate sampling probabilities:
+         # alpha determines how much prioritization is used 
+         # (0 = uniform, 1 = full prioritization)
+-        probs = 0#TODO
++        probs = priorities ** self.alpha
+         probs /= np.sum(probs)
+         
+-        # TODO: Sample indices based on priorities and get corresponding transitions
+-        indices = 0#TODO
++        # Sample with replacement, as in proportional PER.
++        indices = np.random.choice(len(self.memory), batch_size, p=probs)
+         samples = [self.memory[idx] for idx in indices]
+         
+-        # TODO: Calculate importance sampling weights:
++        # Calculate importance sampling weights:
+         # The sampling is biased towards high-priority samples since they are sampled more frequently.
+-        # This can result on Q value overestimation towards high-priority samples.
+-        # To correct for this bias, we use importance sampling weights.
++        # This changes the training distribution relative to uniform replay.
++        # Importance sampling weights compensate for that sampling bias.
+         # Beta here controls how strongly you correct the bias using importance sampling (0 = no correction, 1 = full correction).
+-        weights = 0#TODO
++        weights = (len(self.memory) * probs[indices]) ** (-self.beta)
+         weights /= np.max(weights)  # Normalize weights
+         weights = torch.tensor(weights, dtype=torch.float32)
+         
+@@ -116,9 +113,8 @@ class PrioritizedReplayMemory:
+     
+     def update_priorities(self, indices, td_errors):
+         """Update priorities based on TD errors"""
+-        for idx, td_error in zip(indices, td_errors):
+-            # TODO: Priority is measured as absolute TD error plus small constant to avoid zero priority
+-            self.priorities[idx] = 0#TODO
++        for idx, td_error in zip(indices, np.asarray(td_errors).reshape(-1)):
++            self.priorities[idx] = abs(float(td_error)) + self.eps
+     
+     def __len__(self):
+         return len(self.memory)
+@@ -133,7 +129,24 @@ class DQNAgent:
+                  lr=1e-3, hidden_size = 128, replay_size = 10000, epsilon_start = 0.9, epsilon_end = 0.05, 
+                  epsilon_decay = 500, gamma = 0.99, target_update = 10, tau = 0.005,
+                  alpha=0.6, beta=0.4,
+-                 use_double_dqn=False, use_per=False, dueling_dqn=False):
++                 use_double_dqn=False, use_per=False, dueling_dqn=False,
++                 seed=0, run_name=None, output_root=".", record_video=True):
++
++        self.seed = seed
++        random.seed(seed)
++        np.random.seed(seed)
++        torch.manual_seed(seed)
++        if torch.cuda.is_available():
++            torch.cuda.manual_seed_all(seed)
++        torch.backends.cudnn.benchmark = False
++        torch.backends.cudnn.deterministic = True
++        if episodes < 1 or batch_size < 1 or replay_size < batch_size:
++            raise ValueError("Need episodes >= 1 and replay_size >= batch_size >= 1")
++        if target_update < 1 or save_interval < 1 or epsilon_decay <= 0:
++            raise ValueError("Update/save intervals and epsilon_decay must be positive")
++        if not 0 <= tau <= 1:
++            raise ValueError("tau must lie in [0, 1]")
++        self.record_video = record_video
+         
+         # Create environment
+         self.env_name = env_name
+@@ -159,6 +172,7 @@ class DQNAgent:
+         
+ 
+         self.action_space = self.env.action_space
++        self.action_space.seed(seed)
+ 
+ 
+         # Hyperparameters
+@@ -197,18 +211,18 @@ class DQNAgent:
+         # but there is no policy in DQN, instead the actions are selected via epsilon-greedy from the Q-values.
+         if self.dueling_dqn:
+             if not self.is_cnn:
+-                self.policy_net = DuelingMLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n).to(self.device)
+-                self.target_net = DuelingMLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n).to(self.device)
++                self.policy_net = DuelingMLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
++                self.target_net = DuelingMLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
+             else:
+-                self.policy_net = DuelingCNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n).to(self.device)
+-                self.target_net = DuelingCNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n).to(self.device)
++                self.policy_net = DuelingCNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
++                self.target_net = DuelingCNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
+         else:
+             if not self.is_cnn:
+-                self.policy_net = MLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n).to(self.device)
+-                self.target_net = MLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n).to(self.device)
++                self.policy_net = MLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n, hidden_sizes=(hidden_size, hidden_size)).to(self.device)
++                self.target_net = MLPNetwork(input_dim=self.obs_dim, output_dim=self.action_space.n, hidden_sizes=(hidden_size, hidden_size)).to(self.device)
+             else:
+-                self.policy_net = CNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n).to(self.device)
+-                self.target_net = CNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n).to(self.device)
++                self.policy_net = CNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
++                self.target_net = CNNNetwork(input_shape=self.input_shape, output_dim=self.action_space.n, hidden_size=hidden_size).to(self.device)
+         # Target network, which is used for stable Q-value targets gets updated less frequently
+         self.target_net.load_state_dict(self.policy_net.state_dict())
+         self.target_net.eval()
+@@ -237,7 +251,26 @@ class DQNAgent:
+             self.variant_tag += "_dueling"
+         if self.use_per:
+             self.variant_tag += "_PERreplay"
+-        self.logger = Logger(self.env_tag, self.env_name, self.action_space.n, self.variant_tag, self.num_params)
++        self.logger = Logger(self.env_tag, self.env_name, self.action_space.n,
++                             self.variant_tag, self.num_params, run_name=run_name,
++                             seed=seed, output_root=output_root)
++        self.checkpoint_dir = Path(output_root) / "checkpoints" / self.env_tag / Path(self.logger.log_dir).name
++        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
++        self.config = dict(
++            env=env_name, episodes=episodes, batch_size=batch_size, lr=lr,
++            hidden_size=hidden_size, replay_size=replay_size,
++            epsilon_start=epsilon_start, epsilon_end=epsilon_end,
++            epsilon_decay=epsilon_decay, gamma=gamma, target_update=target_update,
++            tau=tau, alpha=alpha, beta=beta, use_double_dqn=use_double_dqn,
++            use_per=use_per, dueling_dqn=dueling_dqn, seed=seed,
++            run_name=run_name, record_video=record_video, save_interval=save_interval,
++            device=str(self.device), torch_version=torch.__version__,
++            gymnasium_version=gym.__version__, numpy_version=np.__version__,
++            torch_threads=torch.get_num_threads(),
++        )
++        (Path(self.logger.log_dir) / "config.json").write_text(json.dumps(self.config, indent=2))
++        self.logger.writer.add_text("run/hyperparameters", json.dumps(self.config, indent=2))
++        print(f"Logs: {self.logger.log_dir}")
+ 
+ 
+ 
+@@ -267,13 +300,11 @@ class DQNAgent:
+                     state_encoded = utils.encode_obs(state, self.env.observation_space)
+                     state_tensor = torch.from_numpy(state_encoded).float().unsqueeze(0).to(self.device)
+ 
+-                # TODO: Return the greedy action from the policy network
++                # Return the greedy action from the policy network
+                 # HINT: You need to get the action with the highest Q-value from the policy.
+-                return 0#TODO
++                return self.policy_net(state_tensor).argmax(dim=1).item()
+         else:
+-            # TODO: return the return random action. 
+-            # HINT: This is exploration
+-            return 0#TODO
++            return self.action_space.sample()
+         
+ 
+     def optimize_model(self):
+@@ -299,21 +330,16 @@ class DQNAgent:
+         # Create masks for non-final states (to make sure we don't use final next states in target Q-value computation)
+         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)), device=self.device, dtype=torch.bool)
+ 
+-        if self.is_cnn:
+-            # For image observations:
+-            non_final_next_states = torch.cat([torch.from_numpy(utils.preprocess_image(s)).float().unsqueeze(0) 
+-                                    for s in batch.next_state if s is not None]).to(self.device)
+-            state_batch = torch.cat([torch.from_numpy(utils.preprocess_image(s)).float().unsqueeze(0) 
+-                                    for s in batch.state]).to(self.device)
+-        else:
+-            # For vector observations:
+-            non_final_next_states = torch.cat([torch.from_numpy(utils.encode_obs(s, self.env.observation_space)).float().unsqueeze(0) 
+-                                    for s in batch.next_state if s is not None]).to(self.device)
+-            state_batch = torch.cat([torch.from_numpy(utils.encode_obs(s, self.env.observation_space)).float().unsqueeze(0) 
+-                                    for s in batch.state]).to(self.device)
++        def stack_states(states):
++            if self.is_cnn:
++                encoded = [utils.preprocess_image(s) for s in states]
++            else:
++                encoded = [utils.encode_obs(s, self.env.observation_space) for s in states]
++            return torch.as_tensor(np.stack(encoded), dtype=torch.float32, device=self.device)
+ 
+-        action_batch = torch.tensor([[a] for a in batch.action], device=self.device)
+-        reward_batch = torch.cat(batch.reward)
++        state_batch = stack_states(batch.state)
++        action_batch = torch.tensor(batch.action, device=self.device, dtype=torch.long).unsqueeze(1)
++        reward_batch = torch.cat(batch.reward).to(self.device, dtype=torch.float32)
+ 
+ 
+         # Compute Q(s_t, a) for current states.
+@@ -328,16 +354,14 @@ class DQNAgent:
+         # We will have either the expected state value or 0 in case the state was final (via the mask)
+         next_state_values = torch.zeros(self.batch_size, device=self.device)
+         with torch.no_grad():
+-            if self.use_double_dqn:
+-                # * Double DQN Implementation
+-                # TODO: Get the actions that maximize the Q values from the policy network (argmax)
+-                best_actions = 0#TODO
+-                # TODO: Get Q-values from target network using the actions from policy network. The target network only evaluates the chosen action's Q-value
+-                next_state_values[non_final_mask] = 0#TODO
+-            else:
+-                # * DQN Implementation
+-                # TODO: Take all Q-values from the target network and pick the max values directly again with the target network
+-                next_state_values[non_final_mask] = 0#TODO
++            # An entire sampled batch can be terminal. Do not concatenate an empty list.
++            if non_final_mask.any():
++                non_final_next_states = stack_states([s for s in batch.next_state if s is not None])
++                if self.use_double_dqn:
++                    best_actions = self.policy_net(non_final_next_states).argmax(dim=1, keepdim=True)
++                    next_state_values[non_final_mask] = self.target_net(non_final_next_states).gather(1, best_actions).squeeze(1)
++                else:
++                    next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(dim=1).values
+ 
+ 
+         # Compute the expected Q values (reward + discounted max next state value)
+@@ -356,7 +380,8 @@ class DQNAgent:
+             # Multiply the loss by the importance sampling weights that we get from the PER buffer
+             criterion = nn.SmoothL1Loss(reduction='none')
+             losses = (criterion(state_action_values, expected_state_action_values.unsqueeze(1)))
+-            loss = (weights * losses).mean()
++            # losses is [B, 1]. Keep one weight per sample, avoiding [B, B] broadcasting.
++            loss = (weights * losses.squeeze(1)).mean()
+         else:
+             # * Standard Replay Implementation
+             criterion = nn.SmoothL1Loss()
+@@ -384,7 +409,7 @@ class DQNAgent:
+         """Main training loop for DQN agent."""
+ 
+         for i_episode in range(self.episodes):
+-            state, info = self.env.reset()
++            state, info = self.env.reset(seed=self.seed + i_episode)
+             total_reward = 0.0
+             episode_loss = 0.0
+             optimization_steps = 0
+@@ -397,9 +422,10 @@ class DQNAgent:
+                 # Accumulate reward
+                 total_reward += reward
+ 
+-                reward = torch.tensor([reward], device=self.device)
++                reward = torch.tensor([reward], dtype=torch.float32)
+ 
+-                if terminated or truncated:
++                # A time-limit truncation still bootstraps from the final observation.
++                if terminated:
+                     next_state = None
+ 
+                 # Store the transition in memory
+@@ -417,45 +443,48 @@ class DQNAgent:
+ 
+                 # Soft update of the target network's weights
+                 # θ′ ← τ θ + (1 −τ )θ′
+-                if self.tau > 0 and t % self.target_update == 0:  # Soft update every target_update steps
++                if self.tau > 0 and self.steps_done % self.target_update == 0:
+                     target_net_state_dict = self.target_net.state_dict()
+                     policy_net_state_dict = self.policy_net.state_dict()
+                     for key in policy_net_state_dict:
+                         target_net_state_dict[key] = policy_net_state_dict[key]*self.tau + target_net_state_dict[key]*(1-self.tau)
+                     self.target_net.load_state_dict(target_net_state_dict)
+-                elif self.tau == 0 and t % self.target_update == 0:  # Hard update every target_update steps
++                elif self.tau == 0 and self.steps_done % self.target_update == 0:
+                     self.target_net.load_state_dict(self.policy_net.state_dict())
+ 
+                 if terminated or truncated:
+                     break
+ 
+             # Log episode statistics
+-            self.logger.add_value('train-dqn/episode_reward', total_reward, i_episode)
++            episode = i_episode + 1
++            self.logger.add_value('train-dqn/episode_reward', total_reward, episode)
+ 
+             if optimization_steps > 0:
+                 avg_episode_loss = episode_loss / optimization_steps
+-                self.logger.add_value('train-dqn/avg_loss', avg_episode_loss, i_episode)
++                self.logger.add_value('train-dqn/avg_loss', avg_episode_loss, episode)
+ 
+-            self.logger.add_value('train-dqn/epsilon', self.eps_threshold, i_episode)
++            self.logger.add_value('train-dqn/epsilon', self.eps_threshold, episode)
++            self.logger.add_value('train-dqn/environment_steps', self.steps_done, episode)
+ 
+             # Save model and evaluate at intervals
+-            if i_episode % self.save_interval == 0:
+-                if not os.path.exists('checkpoints'):
+-                    os.makedirs('checkpoints')
+-                torch.save(self.policy_net.state_dict(), f'checkpoints/{self.variant_tag}_{self.env_name}_episode_{i_episode}.pth')
++            if episode % self.save_interval == 0 or episode == self.episodes:
++                torch.save(self.policy_net.state_dict(), self.checkpoint_dir / f'episode_{episode}.pth')
+                 
+                 # Evaluate policy and log video
+-                avg_eval_reward = utils.evaluate_policy(self.policy_net, self.env.observation_space, self.env_name, episodes=3, return_frames=False)
+-                self.logger.add_value('train-dqn/eval_mean_reward', avg_eval_reward, i_episode)
++                avg_eval_reward = utils.evaluate_policy(self.policy_net, self.env.observation_space, self.env_name, episodes=3, return_frames=False, seed=100000 + self.seed)
++                self.logger.add_value('train-dqn/eval_mean_reward', avg_eval_reward, episode)
+                 
+                 # Log evaluation video
+-                _, frames = utils.evaluate_policy(self.policy_net, self.env.observation_space, self.env_name, episodes=1, return_frames=True, max_length=1000)
+-                self.logger.add_frames('train-dqn/eval_video', frames, i_episode)
++                if self.record_video:
++                    _, frames = utils.evaluate_policy(self.policy_net, self.env.observation_space, self.env_name, episodes=1, return_frames=True, max_length=300, seed=200000 + self.seed)
++                    self.logger.add_frames('train-dqn/eval_video', frames, episode)
+ 
+-            print(f"Episode {i_episode} - Total Reward: {total_reward:.2f}, Epsilon: {self.eps_threshold:.3f}")
++            print(f"Episode {episode} - Total Reward: {total_reward:.2f}, Epsilon: {self.eps_threshold:.3f}")
+ 
+         print('Training complete')
+         self.env.close()
++        self.logger.writer.close()
++        (Path(self.logger.log_dir) / "completed.json").write_text(json.dumps({"episodes": self.episodes}))
+ 
+ 
+ 
+diff --git a/logger.py b/logger.py
+index 1e4cb23..aeb4c60 100644
+--- a/logger.py
++++ b/logger.py
+@@ -7,16 +7,23 @@ Created by: Joseph Campbell and Guven Gergerli
+ import numpy as np
+ import os
+ import time
++import re
+ 
+ from torch.utils.tensorboard import SummaryWriter
+ 
+ 
+ class Logger:
+-    def __init__(self, env_tag, env_name, action_dim, source_tag, num_params):
++    def __init__(self, env_tag, env_name, action_dim, source_tag, num_params,
++                 run_name=None, seed=0, output_root="."):
+         """Configure TensorBoard logging."""
+ 
+-        log_dir = os.path.join('runs', env_tag, f"{source_tag}_{int(time.time())}")
+-        os.makedirs(log_dir, exist_ok=True)
++        if run_name is not None and not re.fullmatch(r"[A-Za-z0-9_.-]+", run_name):
++            raise ValueError("run_name must contain only letters, digits, underscores, dots or hyphens")
++        label = run_name if run_name else f"{source_tag}_{time.time_ns()}"
++        log_dir = os.path.join(output_root, 'runs', env_tag, f"{label}_seed{seed}")
++        # Never silently merge two experiments into the same event directory.
++        os.makedirs(log_dir, exist_ok=False)
++        self.log_dir = log_dir
+         self.writer = SummaryWriter(log_dir=log_dir)
+         
+         # Log configuration information
+@@ -36,4 +43,4 @@ class Logger:
+ 
+         video = np.array([np.transpose(frame, [0, 3, 1, 2]) for frame in frames])
+ 
+-        self.writer.add_video('{}'.format(name), video, x, fps=fps)
+\ No newline at end of file
++        self.writer.add_video('{}'.format(name), video, x, fps=fps)
+diff --git a/main.py b/main.py
+index 7fc1eeb..93ef4d2 100644
+--- a/main.py
++++ b/main.py
+@@ -11,16 +11,17 @@ Examples:
+ 
+ import os
+ import argparse
++import torch
+ from dqn import DQNAgent
+ 
+ DATA_DIR = "data"
+ 
+ 
+ def main():
+-    """Entry point for HW 2."""
++    """Entry point for CS 557 Homework 1."""
+ 
+     parser = argparse.ArgumentParser(
+-        description='CS 593 RL1: HW2',
++        description='CS 557 RLI: HW1 - Deep Q Networks',
+         formatter_class=argparse.RawDescriptionHelpFormatter
+     )
+     
+@@ -67,7 +68,7 @@ def main():
+         '--num_epochs',
+         type=int,
+         default=100,
+-        help='Number of training epochs'
++        help='Number of training episodes (the starter calls these epochs)'
+     )
+ 
+     parser.add_argument(
+@@ -147,7 +148,13 @@ def main():
+         help='Importance sampling exponent for PER'
+     )
+ 
++    parser.add_argument('--seed', type=int, default=0)
++    parser.add_argument('--run_name', type=str, default=None)
++    parser.add_argument('--output_root', type=str, default='.')
++    parser.add_argument('--no_video', action='store_true', help='Log scalars without evaluation videos')
++    parser.add_argument('--torch_threads', type=int, default=1, help='CPU threads; 1 avoids overhead for small networks')
+     args = parser.parse_args()
++    torch.set_num_threads(args.torch_threads)
+ 
+     # Ensure directories exist
+     os.makedirs(DATA_DIR, exist_ok=True)
+@@ -171,7 +178,11 @@ def main():
+         beta=args.beta,
+         use_double_dqn=args.use_double_dqn,
+         use_per=args.use_per,
+-        dueling_dqn=args.use_dueling_dqn
++        dueling_dqn=args.use_dueling_dqn,
++        seed=args.seed,
++        run_name=args.run_name,
++        output_root=args.output_root,
++        record_video=not args.no_video,
+     )
+     
+     dqn_agent.train()
+diff --git a/networks.py b/networks.py
+index a2308c8..ecec461 100644
+--- a/networks.py
++++ b/networks.py
+@@ -59,14 +59,13 @@ class DuelingMLPNetwork(nn.Module):
+     def forward(self, x):
+         features = self.feature_layer(x)
+ 
+-        #TODO: Implement value and advantage streams
+-        value = 0#TODO
+-        advantages = 0#TODO
++        value = self.value_head(features)
++        advantages = self.advantage_head(features)
+ 
+-        # TODO: Now combine value and advantage using the dueling formula:
++        # Combine value and advantage using the dueling formula:
+         # Q value is equal to the state value + advantages substracted by the mean advantage across all actions
+         # This ensures the advantage head has zero mean. HINT: use keepdim=True in the mean calculation
+-        return 0#TODO
++        return value + advantages - advantages.mean(dim=1, keepdim=True)
+     
+ 
+ 
+diff --git a/utils.py b/utils.py
+index 5a4b883..238b7c8 100644
+--- a/utils.py
++++ b/utils.py
+@@ -8,6 +8,7 @@ import gymnasium as gym
+ import numpy as np
+ import os
+ import torch
++import cv2
+ from wrapper import FrameStackResize
+ 
+ 
+@@ -81,7 +82,7 @@ def preprocess_image(obs):
+     return obs
+ 
+ 
+-def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = False, max_length = None):
++def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = False, max_length = None, seed = None):
+     """
+     Evaluate the current policy on the environment.
+     
+@@ -97,32 +98,40 @@ def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = F
+         (Optional) Rendered frames from each episode
+     """
+ 
++    render_mode = "rgb_array" if return_frames else None
+     if env_name == 'CarRacing-v2':
+-        env = gym.make(env_name, render_mode="rgb_array", continuous=False)
++        env = gym.make(env_name, render_mode=render_mode, continuous=False)
+         env = FrameStackResize(env, num_stack=4, resize_shape=(84, 84))
+         is_cnn = True
+     else:
+-        env = gym.make(env_name, render_mode="rgb_array")
++        env = gym.make(env_name, render_mode=render_mode)
+         is_cnn = False
+ 
++    was_training = policy.training
+     policy.eval()
+     rewards = []
+     frames = []
+     
+     device = next(policy.parameters()).device
+ 
+-    for _ in range(episodes):
+-        obs, _ = env.reset()
++    def render_frame():
++        # Keep video capture bounded; full-resolution 1000-frame rollouts use gigabytes.
++        frame = env.render()
++        height, width = frame.shape[:2]
++        scale = min(1.0, 320.0 / max(height, width))
++        if scale < 1.0:
++            frame = cv2.resize(frame, (round(width * scale), round(height * scale)),
++                               interpolation=cv2.INTER_AREA)
++        return frame
++
++    for episode in range(episodes):
++        obs, _ = env.reset(seed=None if seed is None else seed + episode)
+         done = False
+         episode_reward = 0.0
+         t = 0
+ 
+         if return_frames:
+-            # For CarRacing render the unwrapped env to get the RGB image
+-            if is_cnn:
+-                frames.append([env.env.render()])
+-            else:
+-                frames.append([env.render()])
++            frames.append([render_frame()])
+         
+         while not done:
+ 
+@@ -131,23 +140,21 @@ def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = F
+                 # For image observations, preprocess to channel-first format
+                 # obs_processed = preprocess_image(obs)
+                 # obs_vec = torch.from_numpy(obs_processed).float().unsqueeze(0)
+-                obs_vec = torch.from_numpy(obs).float().unsqueeze(0).to(device)
++                obs_vec = torch.from_numpy(preprocess_image(obs)).float().unsqueeze(0).to(device)
+             else:
+                 # For vector observations, encode normally
+                 obs_vec = torch.from_numpy(encode_obs(obs, obs_space)).float().unsqueeze(0).to(device)
+ 
+ 
+             with torch.no_grad():
+-                logits = policy(obs_vec)
+-                # TODO: Select the action with highest probability from logits
+-                action = logits.argmax(dim=-1).item()#
++                q_values = policy(obs_vec)
++                action = q_values.argmax(dim=-1).item()
+             
+             # Execute action in environment
+-            # TODO: Step the environment using the selected action and accumulate reward
+-            obs, reward, terminated, truncated, _ = env.step(action)#
++            obs, reward, terminated, truncated, _ = env.step(action)
+ 
+             if return_frames:
+-                frames[-1].append(env.render())
++                frames[-1].append(render_frame())
+ 
+             episode_reward += reward
+             done = terminated or truncated
+@@ -160,6 +167,7 @@ def evaluate_policy(policy, obs_space, env_name, episodes = 5, return_frames = F
+         rewards.append(episode_reward)
+         
+     env.close()
++    policy.train(was_training)
+ 
+     avg_reward = float(np.mean(rewards)) if rewards else 0.0
+ 
+diff --git a/SOLUTION_GUIDE.md b/SOLUTION_GUIDE.md
+new file mode 100644
+index 0000000..9d1ba74
+--- /dev/null
++++ b/SOLUTION_GUIDE.md
+@@ -0,0 +1,279 @@
++# CS 557 HW1: completed implementation and run guide
++
++Source: `qtris123/CS557-HW1` at commit `ed0eff0a37c6ef2a836a236067f6753a259955cd`.
++Read against all five pages of `CS_557_Fall_2026_Assignment1.pdf`.
++
++This package supplies completed code and scripts that produce the required materials when you run the experiments. Short correctness checks are not evidence of convergence. Do not describe expected trends below as measured findings.
++
++## 1. What was completed
++
++| File | Implementation |
++| --- | --- |
++| `dqn.py` | Uniform replay, proportional PER, epsilon-greedy actions, DQN and Double DQN targets; terminal-batch and PER-loss fixes |
++| `networks.py` | Dueling value/advantage aggregation for vector observations |
++| `cnn_networks.py` | Dueling value/advantage aggregation for frame stacks |
++| `utils.py` | Consistent CNN normalization during greedy evaluation; restores network mode |
++| `main.py`, `logger.py` | Seed, run names, configuration recording, separate checkpoint directories, optional videos |
++| `requirements_hw1.txt` | Dependencies for the two Box2D environments without unrelated MuJoCo/Atari dependencies |
++| `verify_solution.py` | Numerical checks of targets, replay, PER weighting, dueling invariants, terminal handling, CNN evaluation |
++| `run_experiments.py` | Prints or executes the 12-run plan; reuses completed runs and refuses conflicting logs |
++| `export_plots.py` | Exports six comparison figures and an actual-results CSV |
++| `package_submission.py` | Packages your finished PDF, completed code, and exactly two baseline DQN run logs |
++
++Use these completed files directly, or compare `solution.patch` with the original starter. Do not combine the snippet-only changes with an otherwise uncorrected starter: the fixes in section 3 also matter.
++
++## 2. Core solution snippets
++
++### Uniform replay (`dqn.py`)
++
++```python
++def push(self, *args):
++    self.memory.append(Transition(*args))
++
++def sample(self, batch_size):
++    return random.sample(self.memory, batch_size)
++```
++
++### Prioritized replay (`dqn.py`)
++
++Use raw priorities `p_i = |delta_i| + eps`, sample with probability `P(i) = p_i**alpha / sum(p_j**alpha)`, and weight each sample by `(N * P(i))**(-beta)`. Sampling is with replacement. Keep priorities un-exponentiated when updating them.
++
++```python
++def sample(self, batch_size):
++    if not self.memory:
++        raise ValueError("Cannot sample an empty replay buffer")
++    priorities = self.priorities[:len(self.memory)].astype(np.float64)
++    probs = priorities ** self.alpha
++    probs /= probs.sum()
++    indices = np.random.choice(len(self.memory), batch_size, p=probs)
++    samples = [self.memory[i] for i in indices]
++    weights = (len(self.memory) * probs[indices]) ** (-self.beta)
++    weights /= weights.max()
++    return samples, indices, torch.tensor(weights, dtype=torch.float32)
++
++def update_priorities(self, indices, td_errors):
++    for i, error in zip(indices, np.asarray(td_errors).reshape(-1)):
++        self.priorities[i] = abs(float(error)) + self.eps
++```
++
++`alpha=0` gives uniform probabilities; `beta=0` gives unit weights. The starter's batch-maximum normalization is preserved. Beta remains fixed at its configured value; no unrequested annealing schedule is added.
++
++### Epsilon-greedy actions (`dqn.py`)
++
++Retain the provided epsilon schedule and preprocessing. The two missing return statements are:
++
++```python
++# Exploitation branch, inside torch.no_grad():
++return self.policy_net(state_tensor).argmax(dim=1).item()
++
++# Exploration branch:
++return self.action_space.sample()
++```
++
++Epsilon decays by environment steps, not by episodes. `--num_epochs` means training episodes.
++
++### Complete `optimize_model` replacement (`dqn.py`)
++
++This version is equivalent to the completed implementation, with the important shape and terminal-state handling shown together.
++
++```python
++def optimize_model(self):
++    if len(self.memory) < self.batch_size:
++        return
++    if self.use_per:
++        transitions, indices, weights = self.memory.sample(self.batch_size)
++        weights = weights.to(self.device)
++    else:
++        transitions = self.memory.sample(self.batch_size)
++
++    batch = Transition(*zip(*transitions))
++
++    def stack_states(states):
++        if self.is_cnn:
++            encoded = [utils.preprocess_image(s) for s in states]
++        else:
++            encoded = [utils.encode_obs(s, self.env.observation_space)
++                       for s in states]
++        return torch.as_tensor(np.stack(encoded), dtype=torch.float32,
++                               device=self.device)
++
++    states = stack_states(batch.state)
++    actions = torch.tensor(batch.action, dtype=torch.long,
++                           device=self.device).unsqueeze(1)
++    rewards = torch.cat(batch.reward).to(self.device, dtype=torch.float32)
++    mask = torch.tensor([s is not None for s in batch.next_state],
++                        dtype=torch.bool, device=self.device)
++    q = self.policy_net(states).gather(1, actions).squeeze(1)  # [B]
++    next_values = torch.zeros(self.batch_size, device=self.device)
++    with torch.no_grad():
++        if mask.any():
++            next_states = stack_states([s for s in batch.next_state
++                                        if s is not None])
++            if self.use_double_dqn:
++                best = self.policy_net(next_states).argmax(1, keepdim=True)
++                next_values[mask] = self.target_net(next_states).gather(1, best).squeeze(1)
++            else:
++                next_values[mask] = self.target_net(next_states).max(1).values
++        targets = rewards + self.gamma * next_values
++        td_errors = targets - q
++
++    losses = nn.functional.smooth_l1_loss(q, targets, reduction="none")
++    loss = (weights * losses).mean() if self.use_per else losses.mean()
++    self.optimizer.zero_grad()
++    loss.backward()
++    torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
++    self.optimizer.step()
++    if self.use_per:
++        self.memory.update_priorities(indices, td_errors.detach().cpu().numpy())
++    return loss.item()
++```
++
++DQN uses `r + gamma * max_a Q_target(s_next, a)`. Double DQN chooses `argmax_a Q_online(s_next, a)` and evaluates that action using `Q_target`. Both use just the immediate reward on a true terminal transition. Gradients flow through the current online Q-values, not the target computation.
++
++### Dueling networks
++
++`networks.py`, `DuelingMLPNetwork.forward`:
++
++```python
++def forward(self, x):
++    features = self.feature_layer(x)
++    value = self.value_head(features)
++    advantages = self.advantage_head(features)
++    return value + advantages - advantages.mean(dim=1, keepdim=True)
++```
++
++`cnn_networks.py`, `DuelingCNNNetwork.forward`:
++
++```python
++def forward(self, x):
++    features = self.features(x).flatten(1)
++    value = self.value_stream(features)
++    advantages = self.advantage_stream(features)
++    return value + advantages - advantages.mean(dim=1, keepdim=True)
++```
++
++Subtract the mean across actions separately for each state. Do not average across the batch.
++
++## 3. Starter bugs corrected beyond the TODOs
++
++- **PER loss broadcasting:** original losses are `[B, 1]` and weights are `[B]`; direct multiplication yields `[B, B]`. The completed implementation squeezes losses to `[B]` before multiplication.
++- **All-terminal minibatches:** do not stack the next-state list or run the next-state networks when that list is empty.
++- **CNN evaluation:** the CarRacing wrapper returns uint8 `[12, 84, 84]` stacks. Training divides by 255, and evaluation must do the same. Use `torch.from_numpy(preprocess_image(obs)).float().unsqueeze(0).to(device)`.
++- **CNN flattening:** use `features.flatten(1)` in both CNN forward methods. `.view(batch_size, -1)` can crash on noncontiguous/channel-last convolution outputs produced by stacked observations.
++- **Termination versus truncation:** replace `if terminated or truncated: next_state = None` with `if terminated: next_state = None`. End the episode on either flag, but bootstrap at an external time limit using the final observation. These environments are not auto-reset wrappers.
++- **Target updates:** schedule updates using `self.steps_done % self.target_update`, not the episode-local `t`. The configured interval now refers consistently to environment steps. For `tau > 0`, apply the soft update; the starter convention `tau == 0` requests hard copies.
++- **Hidden size:** pass the CLI setting into network constructors; the starter silently ignored it. The plan uses 128 for both MLP hidden layers and the CNN fully connected hidden size.
++- **Run identity and evaluation:** log all hyperparameters, seed initialization/environment/action sampling, use separate checkpoint paths, evaluate at the final episode, and restore the previous network training mode after evaluation.
++- **Video memory:** optional rollout clips capture at most 300 steps and resize RGB frames to at most 320 pixels on the longest side. Full greedy evaluation still uses complete episodes. A completion marker is written only after logging closes, so a process killed during video capture cannot be reused as a completed run.
++
++Apply the same fixes and code version to every experiment, including baselines.
++
++## 4. Experiment matrix
++
++The PDF's run-count wording is inconsistent. This plan covers the stricter interpretation: both Part 1 choices on each environment, two new agent/replay choices per environment, and two separate three-value hyperparameter sweeps. No need to run all six agent/replay combinations.
++
++| Part | Environment | Run names | New runs |
++| --- | --- | --- | ---: |
++| 1 | Both | `p1_dqn`, `p1_double_per` | 4 |
++| 2A | Both | `p2a_double`, `p2a_dueling_per` | 4 |
++| 2B, learning rate | LunarLander | `p2b_lr_1em5`, existing `p1_double_per`, `p2b_lr_1em3` | 2 |
++| 2B, epsilon decay | LunarLander | `p2b_decay_5000`, existing `p1_double_per`, `p2b_decay_50000` | 2 |
++| Total | | | **12** |
++
++Both sweeps use **Double DQN + PER on LunarLander**. Change only learning rate in the first sweep (`1e-5, 1e-4, 1e-3`) and only epsilon decay in the second (`5000, 15000, 50000`). The baseline is the identical middle point in both sweeps, so reuse its logs rather than repeating it.
++
++Fixed values: batch size 64, hidden size 128, replay capacity 10000, epsilon start/end 0.9/0.05, gamma 0.99, target update every 2 environment steps, tau 0.005, PER alpha/beta 0.6/0.4, save/evaluate every 20 episodes, seed 0. Use **500 LunarLander episodes** and **100 CarRacing episodes**, as the handout suggests. Videos are optional and off in the experiment launcher to keep logs small.
++
++Each evaluation uses greedy actions and the mean return over the same three evaluation seeds (`100000 + training_seed` through `100002 + training_seed`). They are separate from training reset seeds. One training seed is a compact assignment experiment, not a statistical robustness study.
++
++## 5. Step-by-step execution
++
++Run from the extracted solution directory. These are Linux/WSL terminal commands. Do not install the original requirements file in addition: it includes unrelated dependencies and obsolete pins.
++
++1. Create and activate an environment, then install dependencies:
++
++   ```bash
++   conda create -n cs557rl python=3.10 -y
++   conda activate cs557rl
++   python -m pip install swig==4.3.1
++   python -m pip install -r requirements_hw1.txt
++   ```
++
++   Box2D compiles a C++ extension. On Ubuntu/WSL, install `build-essential` if a compiler is missing (`sudo apt-get install build-essential`). Activate the environment before installation so `swig` is on PATH. If Python's compiler configuration names a missing `clang++`, install with `CC=gcc CXX=g++ python -m pip install -r requirements_hw1.txt` instead. Tested dependencies include PyTorch 2.5.1+cpu and Gymnasium 0.29.0 on Linux/Python 3.12. On an existing GPU environment, keep a PyTorch build compatible with that GPU.
++
++2. Run the correctness checks, then optional short integration runs in a separate output directory:
++
++   ```bash
++   python verify_solution.py
++   python main.py --env LunarLander-v2 --num_epochs 2 --save_interval 1 --batch_size 8 --run_name smoke --output_root smoke --no_video
++   python main.py --env CarRacing-v2 --num_epochs 1 --save_interval 1 --batch_size 8 --run_name smoke --output_root smoke --use_double_dqn --use_dueling_dqn --use_per --no_video
++   ```
++
++   These short runs check execution only. Do not use their curves as the assignment experiments. On a machine without a display, `SDL_VIDEODRIVER=dummy` can be set before commands that record rollout videos.
++
++3. Inspect and run the full experiment plan:
++
++   ```bash
++   python run_experiments.py
++   python run_experiments.py --execute
++   ```
++
++   Or execute sequential parts separately:
++
++   ```bash
++   python run_experiments.py --part p1 --execute
++   python run_experiments.py --part p2a --execute
++   python run_experiments.py --part p2b --execute
++   ```
++
++   Run `p1` before exporting `p2b`: its Lunar Double-DQN+PER run is the shared baseline. Add `--videos` to the launcher if you want TensorBoard rollout videos. Completed matching runs are reused. Interrupted runs are not resumed: move their incomplete run directory aside before rerunning; do not mix event files from different attempts.
++
++4. Generate the figures and inspect training:
++
++   ```bash
++   python export_plots.py
++   tensorboard --logdir runs
++   ```
++
++   Open `http://localhost:6006`. For a remote machine, forward port 6006 to your local machine first. TensorBoard tags are `train-dqn/avg_loss`, `train-dqn/episode_reward`, `train-dqn/eval_mean_reward`, and `train-dqn/epsilon`.
++
++5. Write your report using the six exported figures and measured values from `plots/summary.csv`. Export it to PDF, for example `Tri_Vo_hw1_report.pdf`. Include your full name inside it.
++
++6. Build the submission archive, replacing the name arguments as needed:
++
++   ```bash
++   python package_submission.py --report Tri_Vo_hw1_report.pdf --firstname Tri --lastname Vo
++   ```
++
++   Upload `tri_vo_hw1.zip` to Brightspace. The script requires a real, completed report PDF and refuses to overwrite an existing submission archive. It packages only the two standard-DQN log directories as `selected_runs/LunarLander-v2/` and `selected_runs/CarRacing-v2/`, along with the completed code. It excludes other runs, checkpoints, environments, and intermediate plots.
++
++## 6. Expected output materials
++
++| Output | Purpose |
++| --- | --- |
++| `runs/lunarlander_v2/<run>_seed0/` | LunarLander TensorBoard events and `config.json` |
++| `runs/carracing_v2/<run>_seed0/` | CarRacing TensorBoard events and `config.json` |
++| `checkpoints/<environment_tag>/<run>_seed0/episode_N.pth` | Network checkpoints; not required in submission ZIP |
++| `plots/part1_LunarLander-v2.png` | Part 1 baseline versus Double DQN + PER |
++| `plots/part1_CarRacing-v2.png` | Part 1 baseline versus Double DQN + PER |
++| `plots/part2A_LunarLander-v2.png` | Four agent/replay curves |
++| `plots/part2A_CarRacing-v2.png` | Four agent/replay curves |
++| `plots/part2B_lr.png` | Three learning rates, fixed agent/environment |
++| `plots/part2B_epsilon_decay.png` | Three exploration decay values, fixed agent/environment |
++| `plots/summary.csv` | Measured final/best evaluation return and mean training return over the last 10 episodes |
++| `firstname_lastname_hw1.zip` | Final submission after you supply the completed PDF |
++
++Each PNG contains training loss, training return, and evaluation return panels. Training curves use a trailing 10-observation mean and evaluation curves are unsmoothed; captions identify this. `python export_plots.py --smooth 1` exports raw curves instead.
++
++## 7. What to explain in the report
++
++The handout calls the training metric "accuracy," but this value-based RL implementation has no classification accuracy. State that you report **training episode return, mean Huber loss, and greedy evaluation return**. Do not invent an accuracy metric. A falling TD loss alone does not establish a better policy, especially across replay methods with different sampling distributions and weights.
++
++- **Part 1:** explain replay decorrelation/reuse and target-network stabilization. Include both environments' standard DQN results and the Double-DQN+PER results.
++- **Part 2A:** show all four agent/replay curves on each environment. Compare DQN versus Double DQN with uniform replay to assess the target rule; compare Double DQN with/without PER to assess replay. Dueling+PER versus Double-DQN+PER changes both architecture and target rule, so describe it as an agent comparison without attributing the difference solely to dueling.
++- **Part 2B:** give the fixed settings and the exact three values in each sweep. Report final evaluation return, stability/oscillation, and how quickly useful returns appear. Discuss whether a larger learning rate caused instability or a smaller one learned more slowly only if your curves support it. Faster epsilon decay reduces exploration earlier; slower decay maintains it longer. Either can help or hurt depending on what was learned.
++- State the training episode budgets, environment versions, training seed, evaluation protocol, and smoothing. Compare learning curves, not just the highest noisy checkpoint. Alpha controls how strongly replay prioritizes TD errors; beta controls importance correction. They stay fixed in this plan.
++
++Keep analysis tied to your observed curves. If 100 CarRacing episodes do not learn a useful policy, report that outcome and possible causes rather than claiming success. The handout suggests budgets, not a guaranteed solution threshold.
++
++The handout title says Fall 2026 while its due-date line says October 22, 2025. Use Brightspace for the authoritative deadline.
+diff --git a/VALIDATION.md b/VALIDATION.md
+new file mode 100644
+index 0000000..346b18d
+--- /dev/null
++++ b/VALIDATION.md
+@@ -0,0 +1,26 @@
++# Validation scope
++
++Inspected starter commit: `ed0eff0a37c6ef2a836a236067f6753a259955cd`.
++
++Runtime: Linux, Python 3.12.14, PyTorch 2.5.1+cpu, NumPy 1.26.4,
++Gymnasium 0.29.0, Box2D 2.3.5. GPU execution was not tested.
++
++- Passed all eight checks in `python verify_solution.py`: uniform replay capacity/sampling;
++  PER probabilities/importance weights; numerical DQN versus Double DQN targets;
++  all-terminal batches; per-sample PER weighted Huber loss; dueling aggregation and
++  advantage-shift invariance; termination versus truncation; CNN evaluation normalization.
++- Completed short training/evaluation runs for standard DQN and Double DQN + PER
++  on both LunarLander-v2 and CarRacing-v2, including optional bounded rollout video logging.
++- Completed a CarRacing integration run enabling Double DQN, dueling and PER together.
++- Verified completed-run reuse and rejection of an interrupted run without a completion marker.
++- Exported and visually checked report-figure layout using actual short-run logs.
++  Exported the summary CSV. Partial-set mode was used because full-budget experiments
++  and hyperparameter sweeps were not executed.
++- Exercised submission packaging using an input PDF as a test fixture. Verified code
++  inclusion, exactly two standard-DQN run directories, ZIP integrity, and checkpoint exclusion.
++- Checked Python syntax, whitespace, and that the supplied patch applies to the original starter.
++
++These checks establish implementation and output-pipeline correctness within the tested
++paths. They do not establish convergence or relative agent performance. Run the full
++12-experiment plan to obtain the learning curves and empirical findings for your report.
++No completed empirical report or full-budget experiment logs are included in the solution bundle.
+diff --git a/export_plots.py b/export_plots.py
+new file mode 100644
+index 0000000..caeaded
+--- /dev/null
++++ b/export_plots.py
+@@ -0,0 +1,107 @@
++"""Export six report figures and a CSV from the actual TensorBoard scalars."""
++import argparse
++import csv
++import json
++from pathlib import Path
++
++import matplotlib
++matplotlib.use("Agg")
++import matplotlib.pyplot as plt
++import numpy as np
++from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
++from run_experiments import is_complete, plan, run_dir
++
++METRICS = [
++    ("train-dqn/avg_loss", "Mean training Huber loss"),
++    ("train-dqn/episode_reward", "Training episode return"),
++    ("train-dqn/eval_mean_reward", "Greedy evaluation return"),
++]
++AGENTS = [("p1_dqn", "DQN + uniform"), ("p1_double_per", "Double DQN + PER"),
++          ("p2a_double", "Double DQN + uniform"), ("p2a_dueling_per", "Dueling DQN + PER")]
++
++
++def moving_mean(y, window):
++    y = np.asarray(y, dtype=float)
++    sums = np.concatenate([[0.0], np.cumsum(y)])
++    starts = np.maximum(0, np.arange(len(y)) + 1 - window)
++    return (sums[1:] - sums[starts]) / (np.arange(len(y)) + 1 - starts)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output_root", default=".")
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--smooth", type=int, default=10, help="Causal episode window for training curves")
++    parser.add_argument("--allow_partial", action="store_true", help="For debugging only")
++    args = parser.parse_args()
++    if args.smooth < 1:
++        parser.error("--smooth must be positive")
++    root = Path(args.output_root)
++    destination = root / "plots"
++    destination.mkdir(parents=True, exist_ok=True)
++    data, rows = {}, []
++    for _, env, _, name, _, _ in plan():
++        directory = run_dir(root, env, name, args.seed)
++        if not directory.exists():
++            if args.allow_partial:
++                continue
++            raise SystemExit(f"Missing run: {directory}")
++        if not args.allow_partial and not is_complete(directory):
++            raise SystemExit(f"Incomplete run: {directory}")
++        events = EventAccumulator(str(directory), size_guidance={"scalars": 0}).Reload()
++        available = events.Tags().get("scalars", [])
++        series = {tag: [(p.step, p.value) for p in events.Scalars(tag)]
++                  for tag, _ in METRICS if tag in available}
++        data[env, name] = series
++        config = json.loads((directory / "config.json").read_text())
++        train = series.get("train-dqn/episode_reward", [])
++        evaluation = series.get("train-dqn/eval_mean_reward", [])
++        rows.append(dict(env=env, run=name, seed=args.seed, lr=config["lr"],
++                         epsilon_decay=config["epsilon_decay"],
++                         completed_episodes=train[-1][0] if train else 0,
++                         final_eval_mean_reward=evaluation[-1][1] if evaluation else "",
++                         best_eval_mean_reward=max(y for _, y in evaluation) if evaluation else "",
++                         last_10_train_mean_reward=float(np.mean([y for _, y in train[-10:]])) if train else ""))
++    groups = []
++    for env in ("LunarLander-v2", "CarRacing-v2"):
++        groups.extend([(f"part1_{env}", env, AGENTS[:2]), (f"part2A_{env}", env, AGENTS)])
++    groups.extend([
++        ("part2B_lr", "LunarLander-v2", [("p2b_lr_1em5", "lr=1e-5"), ("p1_double_per", "lr=1e-4"), ("p2b_lr_1em3", "lr=1e-3")]),
++        ("part2B_epsilon_decay", "LunarLander-v2", [("p2b_decay_5000", "decay=5000"), ("p1_double_per", "decay=15000"), ("p2b_decay_50000", "decay=50000")]),
++    ])
++    for title, env, selected in groups:
++        if not any((env, name) in data for name, _ in selected):
++            continue
++        fig, axes = plt.subplots(3, 1, figsize=(8, 9), sharex=True)
++        for ax, (tag, ylabel) in zip(axes, METRICS):
++            for name, label in selected:
++                points = data.get((env, name), {}).get(tag, [])
++                if not points:
++                    continue
++                x, y = map(np.asarray, zip(*points))
++                if not np.isfinite(y).all():
++                    raise ValueError(f"Nonfinite scalar: {env}/{name}/{tag}")
++                if tag != "train-dqn/eval_mean_reward":
++                    y = moving_mean(y, args.smooth)
++                marker = "o" if len(x) == 1 or tag == "train-dqn/eval_mean_reward" else None
++                ax.plot(x, y, label=label, linewidth=1.5, marker=marker, markersize=3)
++            ax.set_ylabel(ylabel)
++            ax.grid(alpha=0.25)
++            if ax.lines:
++                ax.legend(fontsize=8)
++        axes[-1].set_xlabel("Training episode")
++        heading = "Part 1" if title.startswith("part1_") else "Part 2A" if title.startswith("part2A_") else "Part 2B: learning rate" if title == "part2B_lr" else "Part 2B: epsilon decay"
++        fig.suptitle(f"{heading} - {env}\nSeed {args.seed}; training: trailing mean of {args.smooth}; evaluation: mean of 3 episodes, unsmoothed", fontsize=9)
++        fig.tight_layout(rect=(0, 0, 1, 0.95))
++        fig.savefig(destination / f"{title}.png", dpi=180)
++        plt.close(fig)
++    if rows:
++        with (destination / "summary.csv").open("w", newline="") as stream:
++            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
++            writer.writeheader()
++            writer.writerows(rows)
++    print(f"Saved figures and summary: {destination.resolve()}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/package_submission.py b/package_submission.py
+new file mode 100644
+index 0000000..e4aca8d
+--- /dev/null
++++ b/package_submission.py
+@@ -0,0 +1,51 @@
++"""Package the user's completed report, code, and exactly two baseline DQN logs."""
++import argparse
++import json
++from pathlib import Path
++import re
++import zipfile
++from run_experiments import is_complete, run_dir
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--report", required=True, type=Path)
++    parser.add_argument("--firstname", required=True)
++    parser.add_argument("--lastname", required=True)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--output_root", default=".", type=Path)
++    args = parser.parse_args()
++    for value in (args.firstname, args.lastname):
++        if not re.fullmatch(r"[A-Za-z][A-Za-z_-]*", value):
++            parser.error("Use letters, hyphens, or underscores for the submission name")
++    if not args.report.is_file() or args.report.suffix.lower() != ".pdf":
++        parser.error("--report must point to your completed PDF report")
++    if not args.report.read_bytes().startswith(b"%PDF-"):
++        parser.error("The report is not a PDF file")
++    if not all(value.lower() in args.report.stem.lower() for value in (args.firstname, args.lastname)):
++        parser.error("Include your first and last names in the PDF filename")
++    selected = []
++    for env in ("LunarLander-v2", "CarRacing-v2"):
++        directory = run_dir(args.output_root, env, "p1_dqn", args.seed)
++        if not is_complete(directory):
++            parser.error(f"Need a completed baseline DQN run: {directory}")
++        config = json.loads((directory / "config.json").read_text())
++        if config["use_double_dqn"] or config["dueling_dqn"] or config["use_per"]:
++            parser.error(f"Expected standard DQN + uniform replay: {directory}")
++        selected.append((env, directory))
++    output = args.output_root / f"{args.firstname.lower()}_{args.lastname.lower()}_hw1.zip"
++    source = Path(__file__).resolve().parent
++    with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED) as archive:
++        archive.write(args.report, args.report.name)
++        for file in sorted(source.iterdir()):
++            if file.is_file() and (file.suffix == ".py" or file.name.startswith("requirements") or file.name.endswith("GUIDE.md")):
++                archive.write(file, f"code/{file.name}")
++        for env, directory in selected:
++            for file in sorted(directory.rglob("*")):
++                if file.is_file():
++                    archive.write(file, f"selected_runs/{env}/{file.relative_to(directory)}")
++    print(f"Submission ZIP: {output.resolve()}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/requirements_hw1.txt b/requirements_hw1.txt
+new file mode 100644
+index 0000000..d59382e
+--- /dev/null
++++ b/requirements_hw1.txt
+@@ -0,0 +1,11 @@
++# Only dependencies needed for this assignment's two environments.
++# Install SWIG first: python -m pip install swig==4.3.1
++numpy==1.26.4
++# Preserve a newer GPU-compatible PyTorch installation when one is present.
++torch>=2.5.1
++gymnasium[box2d]==0.29.0
++pygame==2.6.1
++opencv-python-headless==4.10.0.84
++tensorboard==2.18.0
++moviepy==1.0.3
++matplotlib==3.9.4
+diff --git a/run_experiments.py b/run_experiments.py
+new file mode 100644
+index 0000000..3fc9909
+--- /dev/null
++++ b/run_experiments.py
+@@ -0,0 +1,106 @@
++"""Print or execute the 12-run HW1 plan. Existing completed runs are reused."""
++import argparse
++import json
++from pathlib import Path
++import shlex
++import subprocess
++import sys
++
++ROOT = Path(__file__).resolve().parent
++BASE = dict(lr=1e-4, batch_size=64, save_interval=20, hidden_size=128,
++            replay_size=10000, epsilon_start=0.9, epsilon_end=0.05,
++            epsilon_decay=15000, gamma=0.99, target_update=2, tau=0.005,
++            alpha=0.6, beta=0.4)
++VARIANTS = [
++    ("p1", "p1_dqn", []),
++    ("p1", "p1_double_per", ["--use_double_dqn", "--use_per"]),
++    ("p2a", "p2a_double", ["--use_double_dqn"]),
++    ("p2a", "p2a_dueling_per", ["--use_dueling_dqn", "--use_per"]),
++]
++
++
++def run_dir(output_root, env, name, seed):
++    return Path(output_root) / "runs" / env.lower().replace("-", "_") / f"{name}_seed{seed}"
++
++
++def is_complete(directory):
++    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
++    config_path = Path(directory) / "config.json"
++    if not config_path.is_file() or not (Path(directory) / "completed.json").is_file():
++        return False
++    config = json.loads(config_path.read_text())
++    events = EventAccumulator(str(directory), size_guidance={"scalars": 0}).Reload()
++    tags = events.Tags().get("scalars", [])
++    for tag in ("train-dqn/episode_reward", "train-dqn/eval_mean_reward"):
++        if tag not in tags or max(p.step for p in events.Scalars(tag)) < config["episodes"]:
++            return False
++    return True
++
++
++def plan(lunar_episodes=500, car_episodes=100):
++    jobs = []
++    for env, episodes in [("LunarLander-v2", lunar_episodes), ("CarRacing-v2", car_episodes)]:
++        for part, name, flags in VARIANTS:
++            jobs.append((part, env, episodes, name, flags, {}))
++    # The p1_double_per Lunar baseline is the central value in both sweeps.
++    for name, changes in [
++        ("p2b_lr_1em5", {"lr": 1e-5}),
++        ("p2b_lr_1em3", {"lr": 1e-3}),
++        ("p2b_decay_5000", {"epsilon_decay": 5000}),
++        ("p2b_decay_50000", {"epsilon_decay": 50000}),
++    ]:
++        jobs.append(("p2b", "LunarLander-v2", lunar_episodes, name,
++                     ["--use_double_dqn", "--use_per"], changes))
++    return jobs
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--execute", action="store_true", help="Without this flag, only print commands")
++    parser.add_argument("--part", choices=["all", "p1", "p2a", "p2b"], default="all")
++    parser.add_argument("--env", choices=["all", "LunarLander-v2", "CarRacing-v2"], default="all")
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--output_root", default=".")
++    parser.add_argument("--videos", action="store_true")
++    parser.add_argument("--lunar_episodes", type=int, default=500)
++    parser.add_argument("--car_episodes", type=int, default=100)
++    args = parser.parse_args()
++    output_root = Path(args.output_root).resolve()
++    jobs = [j for j in plan(args.lunar_episodes, args.car_episodes)
++            if (args.part == "all" or j[0] == args.part) and
++            (args.env == "all" or j[1] == args.env)]
++    if not jobs:
++        parser.error("No runs match this part/environment combination")
++    for part, env, episodes, name, flags, changes in jobs:
++        settings = dict(BASE, **changes)
++        cmd = [sys.executable, str(ROOT / "main.py"), "--env", env,
++               "--num_epochs", str(episodes), "--seed", str(args.seed),
++               "--run_name", name, "--output_root", str(output_root)]
++        for key, value in settings.items():
++            cmd.extend([f"--{key}", str(value)])
++        cmd.extend(flags)
++        if not args.videos:
++            cmd.append("--no_video")
++        print(f"[{part}] {shlex.join(cmd)}", flush=True)
++        if args.execute:
++            directory = run_dir(output_root, env, name, args.seed)
++            if directory.exists():
++                config_path = directory / "config.json"
++                if config_path.is_file():
++                    old = json.loads(config_path.read_text())
++                    expected = dict(settings, episodes=episodes, env=env, seed=args.seed,
++                                    use_double_dqn="--use_double_dqn" in flags,
++                                    dueling_dqn="--use_dueling_dqn" in flags,
++                                    use_per="--use_per" in flags,
++                                    record_video=args.videos)
++                    if any(old.get(key) != value for key, value in expected.items()):
++                        raise SystemExit(f"Existing run has different settings: {directory}")
++                if is_complete(directory):
++                    print(f"Reusing completed run: {directory}", flush=True)
++                    continue
++                raise SystemExit(f"Incomplete run exists: {directory}. Move it aside before retrying.")
++            subprocess.run(cmd, cwd=ROOT, check=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/verify_solution.py b/verify_solution.py
+new file mode 100644
+index 0000000..02b7091
+--- /dev/null
++++ b/verify_solution.py
+@@ -0,0 +1,156 @@
++"""Numerical and integration checks; this is not a convergence benchmark."""
++import tempfile
++import unittest
++from unittest.mock import patch
++from types import SimpleNamespace
++
++import gymnasium as gym
++import numpy as np
++import torch
++from torch import nn
++
++from cnn_networks import DuelingCNNNetwork
++from dqn import DQNAgent, ReplayMemory, PrioritizedReplayMemory, Transition
++from networks import DuelingMLPNetwork
++import utils
++
++torch.set_num_threads(1)
++
++
++def tiny_agent(double=False, terminal=False):
++    agent = DQNAgent.__new__(DQNAgent)
++    agent.batch_size = 1
++    agent.device = torch.device("cpu")
++    agent.is_cnn = False
++    agent.env = SimpleNamespace(observation_space=gym.spaces.Discrete(2))
++    agent.gamma = 0.5
++    agent.use_double_dqn = double
++    agent.use_per = False
++    agent.policy_net = nn.Linear(2, 2, bias=False)
++    agent.target_net = nn.Linear(2, 2, bias=False)
++    with torch.no_grad():
++        # At next_state=1 the online and target networks disagree on the best action.
++        agent.policy_net.weight.copy_(torch.tensor([[0., 9.], [0., 1.]]))
++        agent.target_net.weight.copy_(torch.tensor([[0., 2.], [0., 7.]]))
++    agent.optimizer = torch.optim.SGD(agent.policy_net.parameters(), lr=0.0)
++    agent.memory = ReplayMemory(4)
++    agent.memory.push(0, 0, None if terminal else 1, torch.tensor([1.]))
++    return agent
++
++
++class SolutionChecks(unittest.TestCase):
++    def test_uniform_replay_capacity_and_sample(self):
++        memory = ReplayMemory(3)
++        for i in range(5):
++            memory.push(i, 0, None, torch.tensor([0.]))
++        self.assertEqual([t.state for t in memory.memory], [2, 3, 4])
++        self.assertEqual({t.state for t in memory.sample(3)}, {2, 3, 4})
++
++    def test_per_sampling_probabilities_and_weights(self):
++        memory = PrioritizedReplayMemory(3, alpha=1.0, beta=1.0)
++        for i in range(3):
++            memory.push(i, 0, None, torch.tensor([0.]))
++        memory.update_priorities([0, 1, 2], np.array([[1.], [-2.], [4.]]))
++        np.random.seed(12)
++        _, indices, weights = memory.sample(12000)
++        expected = memory.priorities / memory.priorities.sum()
++        observed = np.bincount(indices, minlength=3) / len(indices)
++        np.testing.assert_allclose(observed, expected, atol=0.015)
++        # For beta=1, weight * sampling_probability is constant within the batch.
++        corrected = weights.numpy() * expected[indices]
++        np.testing.assert_allclose(corrected, np.repeat(corrected[0], len(indices)), rtol=1e-5)
++        self.assertAlmostEqual(weights.max().item(), 1.0)
++        memory.alpha = 0.0
++        memory.beta = 0.0
++        _, indices, weights = memory.sample(12000)
++        np.testing.assert_allclose(np.bincount(indices, minlength=3) / len(indices), [1/3]*3, atol=0.015)
++        self.assertTrue(torch.equal(weights, torch.ones_like(weights)))
++        memory.push(3, 0, None, torch.tensor([0.]))
++        self.assertEqual(memory.memory[0].state, 3)
++        self.assertGreater(memory.priorities[0], 0)
++
++    def test_double_target_separates_selection_and_evaluation(self):
++        # DQN: y=1+0.5*7=4.5 -> Huber(0,4.5)=4.0.
++        # DDQN: online chooses action 0; y=1+0.5*2=2 -> Huber=1.5.
++        for double, expected in [(False, 4.0), (True, 1.5)]:
++            agent = tiny_agent(double=double)
++            self.assertAlmostEqual(agent.optimize_model(), expected)
++            self.assertIsNone(agent.target_net.weight.grad)
++            self.assertEqual(agent.policy_net.weight.grad[0, 1].item(), 0.0)
++
++    def test_all_terminal_batch_has_no_bootstrap(self):
++        for double in (False, True):
++            self.assertAlmostEqual(tiny_agent(double, terminal=True).optimize_model(), 0.5)
++
++    def test_per_weighted_loss_is_per_sample(self):
++        agent = tiny_agent()
++        agent.use_per = True
++        agent.batch_size = 2
++        samples = [Transition(0, 0, None, torch.tensor([r])) for r in [0.5, 3.0]]
++        class FixedMemory:
++            def __len__(self): return 2
++            def sample(self, size): return samples, np.array([0, 1]), torch.tensor([1., 0.1])
++            def update_priorities(self, indices, errors): self.errors = errors.reshape(-1)
++        agent.memory = FixedMemory()
++        # (1 * 0.125 + 0.1 * 2.5) / 2 = 0.1875.
++        self.assertAlmostEqual(agent.optimize_model(), 0.1875, places=6)
++        np.testing.assert_allclose(agent.memory.errors, [0.5, 3.0])
++
++    def test_dueling_mean_and_advantage_shift_invariance(self):
++        torch.manual_seed(2)
++        for model, x, head in [
++            (DuelingMLPNetwork(4, 3, hidden_size=16), torch.randn(2, 4), "advantage_head"),
++            (DuelingCNNNetwork((12, 84, 84), 5, hidden_size=16), torch.randn(2, 12, 84, 84).to(memory_format=torch.channels_last), "advantage_stream"),
++        ]:
++            q = model(x)
++            if head == "advantage_head":
++                value = model.value_head(model.feature_layer(x))
++            else:
++                features = model.features(x).flatten(1)
++                value = model.value_stream(features)
++            torch.testing.assert_close(q.mean(1, keepdim=True), value)
++            with torch.no_grad():
++                getattr(model, head)[-1].bias.add_(5.0)
++            torch.testing.assert_close(model(x), q, atol=1e-6, rtol=1e-5)
++
++    def test_training_preserves_truncation_next_state(self):
++        class OneStep(gym.Env):
++            observation_space = gym.spaces.Box(-2, 2, shape=(4,), dtype=np.float32)
++            action_space = gym.spaces.Discrete(2)
++            def __init__(self, terminal): self.terminal = terminal
++            def reset(self, *, seed=None, options=None): return np.zeros(4, dtype=np.float32), {}
++            def step(self, action): return np.ones(4, dtype=np.float32), 1., self.terminal, not self.terminal, {}
++        for terminal in (False, True):
++            with tempfile.TemporaryDirectory() as output:
++                agent = DQNAgent(episodes=1, batch_size=8, replay_size=8,
++                                 output_root=output, record_video=False)
++                agent.env.close()
++                agent.env = OneStep(terminal)
++                with patch("dqn.utils.evaluate_policy", return_value=0.0):
++                    agent.train()
++                self.assertEqual(agent.memory.memory[0].next_state is None, terminal)
++
++    def test_cnn_evaluation_uses_normalized_stacked_input(self):
++        class Pixels(gym.Env):
++            observation_space = gym.spaces.Box(0, 255, shape=(96, 96, 3), dtype=np.uint8)
++            action_space = gym.spaces.Discrete(5)
++            def reset(self, *, seed=None, options=None): return np.full((96, 96, 3), 255, dtype=np.uint8), {}
++            def step(self, action): return self.reset()[0], 1., True, False, {}
++        class Capture(nn.Module):
++            def __init__(self):
++                super().__init__()
++                self.bias = nn.Parameter(torch.zeros(5))
++            def forward(self, x):
++                self.seen = x.detach()
++                return self.bias.unsqueeze(0)
++        policy = Capture()
++        with patch("utils.gym.make", return_value=Pixels()):
++            reward = utils.evaluate_policy(policy, None, "CarRacing-v2", episodes=1, seed=0)
++        self.assertEqual(reward, 1.0)
++        self.assertEqual(tuple(policy.seen.shape), (1, 12, 84, 84))
++        self.assertEqual(policy.seen.max().item(), 1.0)
++        self.assertTrue(policy.training)
++
++
++if __name__ == "__main__":
++    unittest.main(verbosity=2)
